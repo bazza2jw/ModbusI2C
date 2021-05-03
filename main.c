@@ -81,6 +81,7 @@ static int i2cFd = -1; // current fd to the bus
 static int slaveAddr = 0xFF; // current slave address
 static UCHAR i2cBuffer[1024]; // buffer for I2C read/writes
 #ifdef RASPBERRY_PI_BUILD
+#define TRACE
 #define I2C_DEF_DEV "/dev/i2c-1"
 #else
 // USB - I2C adapter
@@ -94,9 +95,9 @@ int openI2C(int slave);
 int
 main( int argc, char *argv[] )
 {
-    int             iExitCode;
-    CHAR           cCh;
-    BOOL            bDoExit;
+    int             iExitCode = -1;
+    CHAR            cCh = 0;
+    BOOL            bDoExit = FALSE;
 
 
     if( eMBTCPInit( 5002 ) != MB_ENOERR )
@@ -107,9 +108,11 @@ main( int argc, char *argv[] )
     else
     {
         eSetPollingThreadState( STOPPED );
+        bDoExit = FALSE;
+
+#ifdef INTERACTIVE
         /* CLI interface. */
         printf(  "Type 'q' for quit or 'h' for help!\r\n"  );
-        bDoExit = FALSE;
         do
         {
             printf(  "> "  );
@@ -165,13 +168,30 @@ main( int argc, char *argv[] )
             {
                 cCh = getchar(  );
             }
+
         }
         while( !bDoExit );
 
         /* Release hardware resources. */
         ( void )eMBClose(  );
         iExitCode = EXIT_SUCCESS;
+
+#else
+        puts("Starting MODBUS/TCP I2C Stack");
+        if( bCreatePollingThread(  ) != TRUE )
+        {
+            printf(  "Can't start protocol stack! Already running?\r\n"  );
+            bDoExit = TRUE;
+        }
+        while( !bDoExit ) usleep(1000);
+
+        /* Release hardware resources. */
+        ( void )eMBClose(  );
+        iExitCode = EXIT_SUCCESS;
+
+#endif
     }
+
     return iExitCode;
 }
 
@@ -259,9 +279,9 @@ eMBRegHoldingCB( UCHAR * pucRegBuffer, USHORT usAddress, USHORT usNRegs, eMBRegi
     {
         if((i2cFd > 0) && (usNRegs > 0))
         {
-            uint8_t r = (uint8_t)(usAddress & 0xFF);
-            if (write(i2cFd, &r, sizeof(r)) == sizeof(r))
+            if(usAddress & 0x200)
             {
+                // block read only
                 if(read(i2cFd, i2cBuffer, (size_t)usNRegs) == usNRegs)
                 {
                     UCHAR *p = i2cBuffer;
@@ -269,8 +289,49 @@ eMBRegHoldingCB( UCHAR * pucRegBuffer, USHORT usAddress, USHORT usNRegs, eMBRegi
                     {
                         *pucRegBuffer++ = 0; // high byte
                         *pucRegBuffer++ = *p; // low byte
+#ifdef TRACE
+                        printf("%02X ",*p);
+#endif
                     }
+#ifdef TRACE
+                    puts("");
+#endif
                     return MB_ENOERR;
+                }
+                else {
+                    perror("I2CREAD:");
+                }
+
+            }
+            else {
+                uint8_t r = (uint8_t)(usAddress & 0xFF);
+#ifdef TRACE
+                printf("READ %02X %02X\n",r,usNRegs);
+#endif
+                if (write(i2cFd, &r, sizeof(r)) == sizeof(r))
+                {
+                    if(read(i2cFd, i2cBuffer, (size_t)usNRegs) == usNRegs)
+                    {
+                        UCHAR *p = i2cBuffer;
+                        for(int i = 0; i < usNRegs; i++, p++)
+                        {
+                            *pucRegBuffer++ = 0; // high byte
+                            *pucRegBuffer++ = *p; // low byte
+#ifdef TRACE
+                            printf("%02X ",*p);
+#endif
+                        }
+#ifdef TRACE
+                        puts("");
+#endif
+                        return MB_ENOERR;
+                    }
+                    else {
+                        perror("I2CREAD:");
+                    }
+                }
+                else {
+                    perror("READ:WRITEADDR:");
                 }
             }
         }
@@ -279,10 +340,38 @@ eMBRegHoldingCB( UCHAR * pucRegBuffer, USHORT usAddress, USHORT usNRegs, eMBRegi
     /* Update current register values with new values from the protocol stack. */
     case MB_REG_WRITE:
     {
-        if(usAddress >= 0xFF)
+        if(usAddress & 0x200)
+        {
+            // block write
+            if((i2cFd > 0) && (usNRegs > 0))
+            {
+                UCHAR *p = i2cBuffer;
+                for(int i = 0; i < usNRegs; i++,p++)
+                {
+                    pucRegBuffer++; // high byte
+                    *p = *pucRegBuffer++; // low byte
+                }
+#ifdef TRACE
+                printf("BLOCK WRITE %02X %02X\n",usAddress,usNRegs);
+#endif
+
+                if(write(i2cFd,i2cBuffer,(size_t)(usNRegs)) == (usNRegs))
+                {
+                    return MB_ENOERR;
+                }
+                else {
+                    perror("I2CWRITE:");
+                }
+            }
+
+        }
+        else if(usAddress > 0xFF)
         {
             pucRegBuffer++;
             slaveAddr = *pucRegBuffer;
+#ifdef TRACE
+            printf("SETSLAVE %02X\n",slaveAddr);
+#endif
             if(slaveAddr < 0x7F)
             {
                 if(i2cFd > 0) close(i2cFd);
@@ -295,6 +384,9 @@ eMBRegHoldingCB( UCHAR * pucRegBuffer, USHORT usAddress, USHORT usNRegs, eMBRegi
             else
             {
                 // close the i2c connection
+#ifdef TRACE
+                printf("CLOSEI2C\n");
+#endif
                 if(i2cFd > 0) close(i2cFd);
                 slaveAddr = 0xFF;
                 i2cFd = -1;
@@ -314,18 +406,22 @@ eMBRegHoldingCB( UCHAR * pucRegBuffer, USHORT usAddress, USHORT usNRegs, eMBRegi
                     pucRegBuffer++; // high byte
                     *p = *pucRegBuffer++; // low byte
                 }
+#ifdef TRACE
+                printf("WRITE %02X %02X\n",usAddress,usNRegs);
+#endif
 
                 if(write(i2cFd,i2cBuffer,(size_t)(usNRegs+1)) == (usNRegs + 1))
                 {
                     return MB_ENOERR;
+                }
+                else {
+                    perror("I2CWRITE:");
                 }
             }
         }
     }
     break;
 
-    default:
-        break;
     }
     return MB_ENOREG;
 }
@@ -338,9 +434,13 @@ int openI2C(int slave)
     {
         if(ioctl(fd, I2C_SLAVE, slave) != 0)
         {
+            perror("IOCTL:");
             close(fd);
             fd = -1;
         }
+    }
+    else {
+        perror("OPEN:");
     }
     return fd;
 }
